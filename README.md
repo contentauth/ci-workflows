@@ -1,0 +1,97 @@
+# Contentauth CI workflows
+
+Reusable GitHub Actions workflows for Content Authenticity Initiative repositories.
+
+## Slack alerts when CI starts failing
+
+The reusable [CI Slack workflow](.github/workflows/ci-slack.yml) alerts when a
+monitored workflow first fails, then stays quiet until it passes and fails again.
+Each workflow is tracked independently. Successful runs silently re-arm alerts;
+there are no recovery messages. Timeouts and startup failures count as failures.
+Cancelled, skipped, neutral, pull-request, fork, and unrelated-branch results are
+ignored. Pushes, schedules, and manual source runs are supported.
+
+### Setup
+
+1. Create a Slack incoming webhook for the destination channel.
+2. Save it as the organization Actions secret `SLACK_WEBHOOK_URL`, granting access
+   only to participating repositories. Never commit or log the webhook URL.
+   A repository secret of the same name overrides the organization secret.
+3. Add a wrapper like this to each repository's default branch. Replace
+   `REVIEWED_COMMIT_SHA` with a full commit SHA from this repository:
+
+```yaml
+name: Main CI Slack alerts
+
+on:
+  workflow_run:
+    workflows: [Tier 1A, Tier 1B, Tier 2]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  notify:
+    uses: contentauth/ci-workflows/.github/workflows/ci-slack.yml@REVIEWED_COMMIT_SHA
+    with:
+      branch: main
+      workflow-names: '["Tier 1A", "Tier 1B", "Tier 2"]'
+      caller-workflow-path: .github/workflows/main-ci-slack.yml
+      test-delivery: ${{ github.event_name == 'workflow_dispatch' }}
+    secrets:
+      slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+```
+
+The names in the trigger must match `workflow-names` and the source workflows'
+`name` fields. Change both branch settings together. `caller-workflow-path` must
+match the wrapper's actual path. GitHub requires the wrapper on the default branch
+for `workflow_run` delivery.
+
+Run the wrapper manually on the configured branch to send a labeled test message
+without changing alert state. This is a real Slack post, not a dry run.
+
+### Security and operational behavior
+
+- The implementation is inline in the called workflow, so the caller's SHA pin
+  covers all privileged code. No caller or triggering-run code is checked out.
+- Only `actions: read` is needed. The caller's GitHub token reads run metadata and
+  prior artifacts; uploading state uses the job's artifact runtime credentials.
+- Workflow changes in participating repositories can access the shared webhook.
+  Protect those branches and review changes to their workflows. The webhook
+  grants posting access to its Slack channel, not channel-history access.
+- Messages include only the repository, workflow name, result, commit SHA, and
+  source-run link, with link and media unfurling disabled.
+- Per-workflow state artifacts live in the **calling repository**, with 90-day
+  retention refreshed on each processed result. Expired or deleted state means
+  the next observed failure alerts again. Use one wrapper per monitored workflow
+  and branch; changing the wrapper path or branch resets its trusted state.
+- State is accepted only from the configured wrapper's `workflow_run` executions
+  on the configured branch in the same repository.
+- Rerun attempts are tracked. A result from an older run number cannot overwrite
+  health once a newer run number has been processed.
+- Notifications are serialized per wrapper, branch, and workflow, using GitHub's
+  `queue: max` (up to 100 pending jobs). Queue overflow cancels excess jobs.
+- Slack or GitHub API errors fail visibly. Failed Slack delivery does not advance
+  state; rerun the failed notifier after fixing the problem. Slack delivery and
+  state upload are not atomic: if upload fails after Slack accepts the message,
+  a retry can send a duplicate. There are no automatic webhook retries.
+
+## Development
+
+No package installation is required. With Node.js 22+ and `zip`/`unzip`:
+
+```sh
+node --test tests/*.test.mjs
+```
+
+Tests load the actual inline implementation, mock all network requests, and
+exercise archive extraction. The test workflow runs these on pushes and PRs.
+Use `actionlint .github/workflows/*.yml` for workflow validation. If your
+actionlint version predates GitHub's `queue: max`, exclude only that diagnostic:
+
+```sh
+actionlint -ignore 'unexpected key "queue" for "concurrency" section' .github/workflows/*.yml
+```
