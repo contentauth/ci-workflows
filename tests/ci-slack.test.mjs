@@ -77,6 +77,50 @@ test('all tiers and supported run events are monitored', () => {
   }
 });
 
+test('wildcard monitors arbitrary workflow names and preserves transition-only alerts', () => {
+  const all = { ...config, workflowNames: ['*'] };
+  for (const name of ['Release', 'Update schemas', 'New workflow', 'Experimental features (non-blocking)']) {
+    let previous;
+    const alerts = ['success', 'failure', 'failure', 'success', 'failure'].map((conclusion, i) => {
+      const result = notifier.transition(run({ name, conclusion, run_number: i + 1 }), previous, repository, all);
+      previous = result.state;
+      return result.alert;
+    });
+    assert.deepEqual(alerts, [false, true, false, false, true], name);
+  }
+});
+
+test('wildcard still excludes notifier, PRs, forks, other branches and ignored results', () => {
+  const all = notifier.configuration({
+    CI_SLACK_WORKFLOWS: '["*"]', CI_SLACK_BRANCH: config.branch,
+    CI_SLACK_CALLER_PATH: config.callerPath,
+  });
+  const previous = notifier.transition(run({ conclusion: 'failure' }), undefined, repository, all).state;
+  for (const overrides of [
+    { path: config.callerPath, event: 'workflow_dispatch' },
+    { event: 'pull_request' },
+    { event: 'pull_request_target' },
+    { event: 'workflow_run' },
+    { head_repository: { full_name: 'someone/c2pa-rs' } },
+    { head_branch: 'stable' },
+    { conclusion: 'cancelled' },
+    { conclusion: 'skipped' },
+    { conclusion: 'neutral' },
+  ]) {
+    assert.deepEqual(
+      notifier.transition(run({ run_number: 2, ...overrides }), previous, repository, all),
+      { state: previous, alert: false },
+    );
+  }
+});
+
+test('explicit workflow lists also exclude notifier itself by path, regardless of name', () => {
+  const result = transition(run({
+    name: 'Tier 1A', path: config.callerPath, event: 'workflow_dispatch', conclusion: 'failure',
+  }), undefined, repository);
+  assert.deepEqual(result, { state: undefined, alert: false });
+});
+
 test('timeouts and startup failures count as failures', () => {
   for (const conclusion of ['timed_out', 'startup_failure']) {
     assert.equal(transition(run({ conclusion }), undefined, repository).alert, true);

@@ -9,7 +9,7 @@ on:
       workflow-names:
         type: string
         required: true
-        description: JSON array of monitored workflow names, matching the caller's trigger.
+        description: JSON array of monitored workflow names, or ["*"] for all workflows.
       caller-workflow-path:
         type: string
         required: true
@@ -32,7 +32,9 @@ jobs:
       (!inputs.test-delivery && github.event_name == 'workflow_run' &&
         github.event.workflow_run.head_repository.full_name == github.repository &&
         github.event.workflow_run.head_branch == inputs.branch &&
-        contains(fromJSON(inputs.workflow-names), github.event.workflow_run.name) &&
+        github.event.workflow_run.path != inputs.caller-workflow-path &&
+        (contains(fromJSON(inputs.workflow-names), '*') ||
+          contains(fromJSON(inputs.workflow-names), github.event.workflow_run.name)) &&
         contains(fromJSON('["push", "schedule", "workflow_dispatch"]'), github.event.workflow_run.event) &&
         contains(fromJSON('["success", "failure", "timed_out", "startup_failure"]'), github.event.workflow_run.conclusion))
     runs-on: ubuntu-latest
@@ -78,7 +80,8 @@ jobs:
 
           export function transition(run, previous, repository, config) {
             if (
-              !config.workflowNames.includes(run.name) ||
+              (!config.workflowNames.includes('*') && !config.workflowNames.includes(run.name)) ||
+              run.path === config.callerPath ||
               run.head_branch !== config.branch ||
               run.head_repository?.full_name !== repository ||
               !events.has(run.event) ||

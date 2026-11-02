@@ -25,7 +25,7 @@ name: Main CI Slack alerts
 
 on:
   workflow_run:
-    workflows: [Tier 1A, Tier 1B, Tier 2]
+    workflows: ['*']
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -38,17 +38,24 @@ jobs:
     uses: contentauth/ci-workflows/.github/workflows/ci-slack.yml@REVIEWED_COMMIT_SHA
     with:
       branch: main
-      workflow-names: '["Tier 1A", "Tier 1B", "Tier 2"]'
+      workflow-names: '["*"]'
       caller-workflow-path: .github/workflows/main-ci-slack.yml
       test-delivery: ${{ github.event_name == 'workflow_dispatch' }}
     secrets:
       slack-webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
 ```
 
-The names in the trigger must match `workflow-names` and the source workflows'
-`name` fields. Change both branch settings together. `caller-workflow-path` must
-match the wrapper's actual path. GitHub requires the wrapper on the default branch
-for `workflow_run` delivery.
+Use `["*"]` to monitor all workflows, including future additions. The notifier
+excludes its own caller workflow by path. For selected workflows, replace both
+lists with their exact `name` values, such as `[Tier 1A, Tier 1B, Tier 2]` in the
+trigger and `'["Tier 1A", "Tier 1B", "Tier 2"]'` in `workflow-names`.
+Change both branch settings together. `caller-workflow-path` must match the
+wrapper's actual path. GitHub requires the wrapper on the default branch for
+`workflow_run` delivery.
+
+All-workflow coverage still accepts only push, schedule, and manual source runs.
+It checks overall workflow conclusions, not individual jobs. A failed job with
+`continue-on-error` may leave the workflow successful and will not produce an alert.
 
 Run the wrapper manually on the configured branch to send a labeled test message
 without changing alert state. This is a real Slack post, not a dry run.
