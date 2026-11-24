@@ -74,8 +74,11 @@ without changing alert state. This is a real Slack post, not a dry run.
 
 ### Security and operational behavior
 
-- The implementation is inline in the called workflow, so the caller's SHA pin
-  covers all privileged code. No caller or triggering-run code is checked out.
+- The workflow runs [scripts/ci-slack.mjs](scripts/ci-slack.mjs), downloaded from
+  the exact called workflow SHA recorded in the current GitHub run attempt.
+  The caller's SHA pin therefore covers all privileged code. Missing or ambiguous
+  revision metadata fails the job; no moving branch is used as a fallback.
+  No caller or triggering-run code is checked out.
 - Only `actions: read` is needed. The caller's GitHub token reads run metadata and
   prior artifacts; uploading state uses the job's artifact runtime credentials.
 - Workflow changes in participating repositories can access the shared webhook.
@@ -108,14 +111,16 @@ without changing alert state. This is a real Slack post, not a dry run.
 
 ## Development
 
-No package installation is required. With Node.js 22+ and `zip`/`unzip`:
+No package installation is required. With Node.js 22+, Bash, `jq`, and `zip`/`unzip`:
 
 ```sh
 node --test tests/*.test.mjs
 ```
 
-Tests load the actual inline implementation, mock all network requests, and
-exercise archive extraction. The test workflow runs these on pushes and PRs.
+Tests import the notifier module and execute its CLI with network requests mocked,
+and exercise archive extraction. Loader tests check immutable revision selection
+and fail-closed behavior with mocked GitHub and download commands.
+The test workflow runs these on pushes and PRs.
 Use `actionlint .github/workflows/*.yml` for workflow validation. If your
 actionlint version predates GitHub's `queue: max`, exclude only that diagnostic:
 

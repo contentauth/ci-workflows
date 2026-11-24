@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { executable, notifier } from './notifier.mjs';
+import { executeNotifier, notifier } from './notifier.mjs';
 
 const config = {
   branch: 'main',
@@ -318,10 +318,7 @@ test('downloaded state archives are extracted and invalid JSON fails explicitly'
 });
 
 test('manual delivery without a secret exits unsuccessfully without a stack trace', () => {
-  const result = spawnSync(process.execPath, [
-    '--input-type=module',
-  ], {
-    input: executable,
+  const result = executeNotifier({
     env: {
       ...process.env,
       SLACK_WEBHOOK_URL: '',
@@ -375,8 +372,7 @@ test('entry point blocks test delivery from other events and branches', () => {
     { GITHUB_EVENT_NAME: 'pull_request' },
     { GITHUB_REF: 'refs/heads/untrusted' },
   ]) {
-    const result = spawnSync(process.execPath, ['--input-type=module'], {
-      input: executable,
+    const result = executeNotifier({
       env: {
         ...process.env, SLACK_WEBHOOK_URL: '',
         CI_SLACK_WORKFLOWS: '["Build"]', CI_SLACK_BRANCH: 'main',
@@ -415,8 +411,7 @@ test('entry point delivers a failure and writes artifact state and step output',
         throw new Error('Unexpected network request');
       };
     `;
-    const result = spawnSync(process.execPath, ['--input-type=module'], {
-      input: `${mock}\n${executable}`,
+    const result = executeNotifier({
       cwd: directory,
       env: {
         ...process.env,
@@ -429,7 +424,7 @@ test('entry point delivers a failure and writes artifact state and step output',
         CI_SLACK_TEST_DELIVERY: 'false',
       },
       encoding: 'utf8',
-    });
+    }, mock);
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /MOCK_SLACK_DELIVERY/);
     assert.deepEqual(JSON.parse(readFileSync(join(directory, 'ci-slack-state.json'))), {
@@ -445,16 +440,15 @@ test('entry point delivers a failure and writes artifact state and step output',
 test('manual test posts a labeled message without writing state or step output', () => {
   const directory = mkdtempSync(join(tmpdir(), 'ci-slack-manual-'));
   try {
-    const result = spawnSync(process.execPath, ['--input-type=module'], {
-      input: `
+    const mock = `
         globalThis.fetch = async (_url, options) => {
           const text = JSON.parse(options.body).text;
           if (!text.startsWith('[TEST] contentauth/c2pa-rs:')) throw new Error('Not labeled');
           console.log('MOCK_TEST_DELIVERY');
           return new Response('ok');
         };
-        ${executable}
-      `,
+      `;
+    const result = executeNotifier({
       cwd: directory,
       env: {
         ...process.env,
@@ -467,7 +461,7 @@ test('manual test posts a labeled message without writing state or step output',
         GITHUB_OUTPUT: join(directory, 'output'),
       },
       encoding: 'utf8',
-    });
+    }, mock);
 
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /MOCK_TEST_DELIVERY/);
@@ -739,8 +733,7 @@ test('reminder boundaries stay at 03:00 UTC and 15:00 UTC year-round', () => {
               throw new Error('Unexpected request: ' + path);
             };
           `;
-          const result = spawnSync(process.execPath, ['--input-type=module'], {
-            input: `${mock}\n${executable}`,
+          const result = executeNotifier({
             cwd: directory,
             env: {
               ...process.env, RUNNER_TEMP: directory,
@@ -754,7 +747,7 @@ test('reminder boundaries stay at 03:00 UTC and 15:00 UTC year-round', () => {
               CI_SLACK_TEST_DELIVERY: 'false',
             },
             encoding: 'utf8',
-          });
+          }, mock);
           assert.equal(result.status, 0, result.stderr);
           return result;
         };
