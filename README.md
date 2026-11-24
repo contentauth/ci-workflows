@@ -106,26 +106,6 @@ without changing alert state. This is a real Slack post, not a dry run.
   state upload are not atomic: if upload fails after Slack accepts the message,
   a retry can send a duplicate. There are no automatic webhook retries.
 
-### Upgrading existing callers
-
-Publish and review the shared workflow change, then update each caller's full SHA
-pin and add the twice-daily schedule shown above. A schedule alone does not enable
-reminders with an older pin. Callers without a schedule send failure alerts but
-not reminders.
-
-Existing version-1 artifacts remain readable; timestamps are additive.
-For an already-failing workflow without timestamps, the latest completed failure
-provides a conservative known-failing-since timestamp, since the original failure
-time was not stored. It can receive a reminder at the next scheduled slot.
-Failure alerts and reminders track their delivery times independently, so each
-new failure alerts without resetting the reminder schedule. Healthy state and
-existing per-workflow artifact names are unchanged.
-
-Rolling back the caller's SHA pin restores transition-only alerts. Older readers
-ignore scheduled artifacts and the extra fields in completion-event artifacts;
-no artifacts need to be deleted. In-flight runs using the older pin cannot
-coordinate reminder timestamps, so let them finish before changing pins.
-
 ## Development
 
 No package installation is required. With Node.js 22+ and `zip`/`unzip`:
