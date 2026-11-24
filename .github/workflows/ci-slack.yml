@@ -55,7 +55,7 @@ jobs:
           const halfDayMs = 12 * 60 * 60 * 1000;
 
           function reminderSlot(time) {
-            // 07:00/19:00 fixed PST are 15:00/03:00 UTC, including during daylight saving time.
+            // Daily reminder slots start at 03:00 UTC and 15:00 UTC.
             const offset = 3 * 60 * 60 * 1000;
             return Math.floor((time - offset) / halfDayMs) * halfDayMs + offset;
           }

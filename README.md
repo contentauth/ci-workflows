@@ -6,7 +6,7 @@ Reusable GitHub Actions workflows for Content Authenticity Initiative repositori
 
 The reusable [CI Slack workflow](.github/workflows/ci-slack.yml) alerts on every
 new failed run or rerun of a monitored workflow, even if it is already failing.
-It also reminds at **7am and 7pm PST (fixed UTC-8)** while failures persist.
+It also reminds at **03:00 UTC and 15:00 UTC** while failures persist.
 Each workflow is tracked independently. Successful runs silently stop reminders;
 there are no recovery messages. Timeouts and startup failures count as failures.
 Cancelled, skipped, neutral, pull-request, fork, and unrelated-branch results are
@@ -33,7 +33,7 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: '0 3,15 * * *' # 7am and 7pm PST (fixed UTC-8).
+    - cron: '0 3,15 * * *' # 03:00 UTC and 15:00 UTC.
 
 permissions:
   actions: read
@@ -59,9 +59,8 @@ wrapper's actual path. GitHub requires the wrapper on the default branch for
 `workflow_run` delivery.
 
 The schedule checks for due reminders even when CI runs only nightly.
-PST is interpreted literally: reminders use 03:00 and 15:00 UTC year-round, not
-daylight-saving-aware Pacific time. GitHub schedules are best-effort and may run
-late. Each reminder slot is sent at most once after successful state persistence;
+Reminders use 03:00 UTC and 15:00 UTC year-round. GitHub schedules are best-effort
+and may run late. Each reminder slot is sent at most once after successful state persistence;
 repeated or delayed executions do not replay every missed slot. New failure
 alerts do not postpone the fixed-time reminders. A failure immediately before a
 scheduled reminder can therefore produce both messages close together.

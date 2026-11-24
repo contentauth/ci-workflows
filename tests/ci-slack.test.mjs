@@ -478,7 +478,7 @@ test('manual test posts a labeled message without writing state or step output',
   }
 });
 
-test('reminders follow 7am and 7pm PST without needing a new CI run', async () => {
+test('reminders follow 03:00 UTC and 15:00 UTC without needing a new CI run', async () => {
   const source = run({ conclusion: 'failure' });
   const messages = [];
   const logs = [];
@@ -606,7 +606,7 @@ test('legacy failing state is eligible at the next fixed slot without fabricatin
     repository, { now }), /timestamp/);
 });
 
-test('PST reminder boundaries stay at 03:00 and 15:00 UTC in winter and summer', () => {
+test('reminder boundaries stay at 03:00 UTC and 15:00 UTC year-round', () => {
   for (const at of [
     '2026-11-19T03:00:00Z', '2026-11-19T15:00:00Z',
     '2027-07-19T03:00:00Z', '2027-07-19T15:00:00Z',
