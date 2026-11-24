@@ -100,16 +100,20 @@ export function transition(run, previous, repository, config, { now = Date.now()
       if (previous.last_reminder_slot !== undefined) state.last_reminder_slot = previous.last_reminder_slot;
     }
   }
-  const alert = failing && (!sweep || now >= nextReminder(state));
+  const newResult = !previous || run.run_number > previous.run_number ||
+    run.run_attempt > previous.run_attempt;
+  const reason = failing ? (newResult ? 'failure' :
+    sweep && now >= nextReminder(state) ? 'reminder' : 'not-due') :
+    previous?.failing ? 'recovered' : 'healthy';
+  const alert = reason === 'failure' || reason === 'reminder';
   if (alert) {
     state.last_alert_at = now;
-    if (sweep) state.last_reminder_slot = reminderSlot(now);
+    if (reason === 'reminder') state.last_reminder_slot = reminderSlot(now);
   }
   return {
     state,
     alert,
-    reason: alert ? (sweep ? 'reminder' : 'failure') :
-      failing ? 'not-due' : previous?.failing ? 'recovered' : 'healthy',
+    reason,
   };
 }
 
@@ -252,28 +256,35 @@ export async function latestRun(workflowId, repository, request, config) {
 
 export async function discover(repository, request, config, now = Date.now()) {
   const ids = [];
+  const errors = [];
   for (let page = 1; ; page++) {
     const { workflows } = await (await request(`/actions/workflows?per_page=100&page=${page}`)).json();
     for (const workflow of workflows) {
       if (workflow.state !== 'active' || workflow.path === config.callerPath ||
           (!config.workflowNames.includes('*') && !config.workflowNames.includes(workflow.name))) continue;
-      const run = await latestRun(workflow.id, repository, request, config);
-      if (!run) {
-        console.log(JSON.stringify({
-          decision: 'suppressed', reason: 'no-eligible-result', workflow: workflow.name,
-        }));
-        continue;
+      try {
+        const run = await latestRun(workflow.id, repository, request, config);
+        if (!run) {
+          console.log(JSON.stringify({
+            decision: 'suppressed', reason: 'no-eligible-result', workflow: workflow.name,
+          }));
+          continue;
+        }
+        const previous = await loadState(workflow.id, repository, request, config);
+        const result = transition(run, previous, repository, config, { now, sweep: true });
+        const shouldProcess = result.alert || (previous?.failing &&
+          (!result.state.failing || previous.failing_since === undefined));
+        if (shouldProcess) ids.push(workflow.id);
+        logDecision(shouldProcess ? 'queued' : 'suppressed', result.reason, run, result.state, now);
+      } catch (error) {
+        const failure = { workflow: workflow.name, workflow_id: workflow.id, error: error.message };
+        errors.push(failure);
+        console.error(JSON.stringify({ decision: 'discovery-failed', ...failure }));
       }
-      const previous = await loadState(workflow.id, repository, request, config);
-      const result = transition(run, previous, repository, config, { now, sweep: true });
-      const process = result.alert || (!previous?.failing && result.state.failing) || (previous?.failing &&
-        (!result.state.failing || previous.failing_since === undefined));
-      if (process) ids.push(workflow.id);
-      logDecision(process ? 'queued' : 'suppressed', result.reason, run, result.state, now);
     }
     if (workflows.length < 100) break;
   }
-  return ids;
+  return { workflowIds: ids, errors };
 }
 
 export async function main() {
@@ -302,7 +313,9 @@ export async function main() {
     throw new Error('Reminder sweeps require the configured branch');
   }
   if (discovery && sweep) {
-    outputIds(await discover(repository, request, config));
+    const result = await discover(repository, request, config);
+    outputIds(result.workflowIds);
+    appendFileSync(process.env.GITHUB_OUTPUT, `discovery-errors=${result.errors.length}\n`);
     return;
   }
   let run;

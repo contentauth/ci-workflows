@@ -144,6 +144,44 @@ test('duplicate events and late completions from older runs are ignored', () => 
   }
 });
 
+test('a delayed sweep delivers a newly discovered failure before suppressing its completion', async () => {
+  const failed = run({ conclusion: 'failure', updated_at: '2026-11-18T15:01:00Z' });
+  const sweepTime = Date.parse('2026-11-18T15:05:00Z');
+  for (const previous of [
+    undefined,
+    transition(run({ run_number: 0 }), undefined, repository).state,
+    transition(run({ conclusion: 'failure', run_number: 0 }), undefined, repository, { now }).state,
+  ]) {
+    const messages = [];
+    const send = async (text) => messages.push(text);
+    const saved = await notify(failed, previous, repository, send, {
+      now: sweepTime, sweep: true,
+    });
+    assert.equal(messages.length, 1);
+    assert.match(messages[0], /Tier 1A is failing on main/);
+    assert.doesNotMatch(messages[0], /still failing/);
+    assert.equal(saved.last_alert_at, sweepTime);
+    const completed = await notify(failed, saved, repository, send, { now: sweepTime + 60_000 });
+    assert.equal(messages.length, 1);
+    assert.deepEqual(completed, saved);
+  }
+});
+
+test('sweep delivery failure leaves a newly discovered run eligible for its completion alert', async () => {
+  const source = run({ conclusion: 'failure', updated_at: '2026-11-18T15:01:00Z' });
+  const previous = transition(run({ run_number: 0 }), undefined, repository).state;
+  const snapshot = structuredClone(previous);
+  await assert.rejects(notify(source, previous, repository, async () => {
+    throw new Error('delivery failed');
+  }, { now: morning + 5 * 60_000, sweep: true }), /delivery failed/);
+  assert.deepEqual(previous, snapshot);
+  const messages = [];
+  await notify(source, previous, repository, async (text) => messages.push(text), {
+    now: morning + 6 * 60_000,
+  });
+  assert.equal(messages.length, 1);
+});
+
 test('each failed rerun alerts; successful reruns clear the failing state', () => {
   const first = transition(run({ conclusion: 'failure' }), undefined, repository);
   const second = transition(run({ conclusion: 'failure', run_attempt: 2 }), first.state, repository);
@@ -682,13 +720,57 @@ test('reminder boundaries stay at 03:00 UTC and 15:00 UTC year-round', () => {
           assert.equal(path, '/actions/artifacts/3/zip');
           return new Response(readFileSync(join(directory, 'fixture.zip')));
         }, { ...config, workflowNames: ['*'] }, now);
-        assert.deepEqual(ids, [1, 3]);
+        assert.deepEqual(ids, { workflowIds: [1, 3], errors: [] });
       } finally {
         if (previousTemp === undefined) delete process.env.RUNNER_TEMP;
         else process.env.RUNNER_TEMP = previousTemp;
         rmSync(directory, { recursive: true });
       }
     });
+
+test('discovery isolates per-workflow API and malformed-state errors without losing other alerts', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ci-slack-discovery-errors-'));
+  const previousTemp = process.env.RUNNER_TEMP;
+  process.env.RUNNER_TEMP = directory;
+  try {
+    writeFileSync(join(directory, 'ci-slack-state.json'), 'not JSON');
+    execFileSync('zip', ['-j', join(directory, 'fixture.zip'), join(directory, 'ci-slack-state.json')]);
+    const workflows = Array.from({ length: 5 }, (_, i) => ({
+      id: i + 1, name: `Build ${i + 1}`, path: `.github/workflows/build-${i + 1}.yml`, state: 'active',
+    }));
+    const result = await notifier.discover(repository, async (path) => {
+      if (path.startsWith('/actions/workflows?')) return Response.json({ workflows });
+      if (path.includes('/runs?')) {
+        const id = Number(path.match(/workflows\/(\d+)/)[1]);
+        if (id === 2) throw new Error('Workflow run API unavailable');
+        return Response.json({ workflow_runs: path.includes('event=push') ? [run({
+          workflow_id: id, name: `Build ${id}`, conclusion: 'failure',
+        })] : [] });
+      }
+      if (path.includes('/actions/artifacts?')) {
+        if (path.includes('state-3&')) throw new Error('Artifact API unavailable');
+        return Response.json({ artifacts: path.includes('state-4&') ? [{
+          id: 4, name: 'ci-slack-state-4', workflow_run: { id: 10, head_branch: 'main' },
+        }] : [] });
+      }
+      if (path === '/actions/runs/10') return Response.json({
+        path: config.callerPath, event: 'schedule', head_branch: 'main',
+        head_repository: { full_name: repository },
+      });
+      assert.equal(path, '/actions/artifacts/4/zip');
+      return new Response(readFileSync(join(directory, 'fixture.zip')));
+    }, { ...config, workflowNames: ['*'] }, morning);
+    assert.deepEqual(result.workflowIds, [1, 5]);
+    assert.deepEqual(result.errors.map((error) => error.workflow_id), [2, 3, 4]);
+    assert.match(result.errors[0].error, /Workflow run API unavailable/);
+    assert.match(result.errors[1].error, /Artifact API unavailable/);
+    assert.match(result.errors[2].error, /JSON/);
+  } finally {
+    if (previousTemp === undefined) delete process.env.RUNNER_TEMP;
+    else process.env.RUNNER_TEMP = previousTemp;
+    rmSync(directory, { recursive: true });
+  }
+});
 
     test('scheduled entry point discovers due reminders, reloads state, and notices recovery before sending', () => {
       const directory = mkdtempSync(join(tmpdir(), 'ci-slack-sweep-'));
@@ -702,7 +784,7 @@ test('reminder boundaries stay at 03:00 UTC and 15:00 UTC year-round', () => {
           execFileSync('zip', ['-j', zipPath, statePath]);
           return readFileSync(zipPath).toString('base64');
         };
-        const execute = (discovery, current = source) => {
+        const execute = (discovery, current = source, discoveryFailure = false) => {
           const mock = `
             Date.now = () => ${morning};
             const source = ${JSON.stringify(current)};
@@ -714,9 +796,13 @@ test('reminder boundaries stay at 03:00 UTC and 15:00 UTC year-round', () => {
                 console.log('MOCK_REMINDER_DELIVERY');
                 return new Response('ok');
               }
-              if (path.includes('/actions/workflows?')) return Response.json({ workflows: [{
-                id: 1, name: source.name, path: source.path, state: 'active',
-              }] });
+              if (path.includes('/actions/workflows?')) return Response.json({ workflows: [
+                { id: 1, name: source.name, path: source.path, state: 'active' },
+                ...(${discoveryFailure} ? [{
+                  id: 2, name: 'Tier 1B', path: '.github/workflows/tier-1b.yml', state: 'active',
+                }] : []),
+              ] });
+              if (path.includes('/actions/workflows/2/runs?')) return new Response('unavailable', { status: 503 });
               if (path.includes('/actions/workflows/1/runs?')) return Response.json({
                 workflow_runs: path.includes('event=push') ? [source] : [],
               });
@@ -752,8 +838,12 @@ test('reminder boundaries stay at 03:00 UTC and 15:00 UTC year-round', () => {
           return result;
         };
 
+        const partial = execute(true, source, true);
+        assert.match(partial.stderr, /"decision":"discovery-failed".*"workflow_id":2/);
+        assert.equal(readFileSync(outputPath, 'utf8'), 'workflow-ids=[1]\ndiscovery-errors=1\n');
+        rmSync(outputPath);
         execute(true);
-        assert.equal(readFileSync(outputPath, 'utf8'), 'workflow-ids=[1]\n');
+        assert.equal(readFileSync(outputPath, 'utf8'), 'workflow-ids=[1]\ndiscovery-errors=0\n');
         rmSync(outputPath);
         const reminder = execute(false);
         assert.match(reminder.stdout, /MOCK_REMINDER_DELIVERY/);
@@ -767,7 +857,7 @@ test('reminder boundaries stay at 03:00 UTC and 15:00 UTC year-round', () => {
         assert.match(overlap.stdout, /"decision":"suppressed","reason":"not-due"/);
         rmSync(outputPath);
         execute(true);
-        assert.equal(readFileSync(outputPath, 'utf8'), 'workflow-ids=[]\n');
+        assert.equal(readFileSync(outputPath, 'utf8'), 'workflow-ids=[]\ndiscovery-errors=0\n');
 
         const recovered = execute(false, run({ run_number: 2 }));
         assert.doesNotMatch(recovered.stdout, /MOCK_REMINDER_DELIVERY/);

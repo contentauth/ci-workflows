@@ -95,12 +95,19 @@ without changing alert state. This is a real Slack post, not a dry run.
   on the configured branch in the same repository.
 - Rerun attempts are tracked. Duplicate completion events and results from older
   run numbers are suppressed, so stale results cannot overwrite newer health.
+- A sweep that discovers an unprocessed failed result sends its failure alert
+  before saving state, even outside a reminder slot. The subsequent completion
+  event is then safely suppressed as a duplicate.
 - Notifications are serialized per wrapper, branch, and workflow, using GitHub's
   `queue: max` (up to 100 pending jobs). Completion events and reminder sweeps use
   the same lock and reload state inside it. Queue overflow cancels excess jobs.
 - Sweeps inspect the latest eligible completed result across push, schedule, and
   manual runs. Discovery queues only notifications, recoveries, and state
   upgrades; healthy workflows do not each consume a notification runner.
+- Discovery errors are isolated per workflow and logged as `discovery-failed`.
+  The discovery job fails visibly, but reminders for unaffected workflows still
+  run. Completion events use one notification job; ignored events are filtered
+  before allocating a runner.
 - Each decision logs `sent`, `suppressed`, `queued`, or `delivery-failed`, its reason,
   and relevant workflow/run metadata. Failing state includes the next reminder
   due time and seconds until that slot. No webhook URLs or tokens are logged.

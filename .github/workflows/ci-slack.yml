@@ -27,9 +27,8 @@ permissions:
 jobs:
   prepare:
     if: >-
-      github.event_name == 'workflow_run' ||
-      (contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name) &&
-        github.ref == format('refs/heads/{0}', inputs.branch))
+      !inputs.test-delivery && github.event_name == 'schedule' &&
+      github.ref == format('refs/heads/{0}', inputs.branch)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -63,19 +62,32 @@ jobs:
           CI_SLACK_TEST_DELIVERY: ${{ inputs.test-delivery }}
           CI_SLACK_DISCOVER: 'true'
         run: node "$RUNNER_TEMP/ci-slack.mjs"
+      - name: Report discovery failures
+        if: steps.notifier.outputs.discovery-errors > 0
+        run: |
+          echo "::error::Reminder discovery failed for one or more workflows; see discovery-failed logs. Other workflows will still be processed."
+          exit 1
   notify:
-    needs: prepare
-    if: needs.prepare.outputs.workflow-ids != '[]'
-    strategy:
-      fail-fast: false
-      matrix:
-        workflow-id: ${{ fromJSON(needs.prepare.outputs.workflow-ids) }}
+    if: >-
+      (inputs.test-delivery && github.event_name == 'workflow_dispatch' &&
+        github.ref == format('refs/heads/{0}', inputs.branch)) ||
+      (!inputs.test-delivery && github.event_name == 'workflow_run' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        github.event.workflow_run.head_branch == inputs.branch &&
+        github.event.workflow_run.path != inputs.caller-workflow-path &&
+        (contains(fromJSON(inputs.workflow-names), '*') ||
+          contains(fromJSON(inputs.workflow-names), github.event.workflow_run.name)) &&
+        contains(fromJSON('["push", "schedule", "workflow_dispatch"]'), github.event.workflow_run.event) &&
+        github.event.workflow_run.status == 'completed' &&
+        contains(fromJSON('["success", "failure", "timed_out", "startup_failure"]'), github.event.workflow_run.conclusion))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
-      group: ci-slack-${{ inputs.caller-workflow-path }}-${{ inputs.branch }}-${{ matrix.workflow-id }}
+      group: ci-slack-${{ inputs.caller-workflow-path }}-${{ inputs.branch }}-${{ github.event.workflow_run.workflow_id || 'test' }}
       queue: max
-    steps:
+    env:
+      CI_SLACK_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id || 'test' }}
+    steps: &notification-steps
       - name: Load notifier from the called workflow revision
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,14 +101,28 @@ jobs:
           CI_SLACK_WORKFLOWS: ${{ inputs.workflow-names }}
           CI_SLACK_CALLER_PATH: ${{ inputs.caller-workflow-path }}
           CI_SLACK_TEST_DELIVERY: ${{ inputs.test-delivery }}
-          CI_SLACK_WORKFLOW_ID: ${{ matrix.workflow-id }}
         run: node "$RUNNER_TEMP/ci-slack.mjs"
       - name: Save alert state
         if: steps.notifier.outputs.save-state == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ci-slack-state-${{ matrix.workflow-id }}
+          name: ci-slack-state-${{ env.CI_SLACK_WORKFLOW_ID }}
           path: ci-slack-state.json
           retention-days: 90
           if-no-files-found: error
           overwrite: true
+  remind:
+    needs: prepare
+    if: ${{ !cancelled() && needs.prepare.outputs.workflow-ids != '' && needs.prepare.outputs.workflow-ids != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        workflow-id: ${{ fromJSON(needs.prepare.outputs.workflow-ids) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: ci-slack-${{ inputs.caller-workflow-path }}-${{ inputs.branch }}-${{ matrix.workflow-id }}
+      queue: max
+    env:
+      CI_SLACK_WORKFLOW_ID: ${{ matrix.workflow-id }}
+    steps: *notification-steps
