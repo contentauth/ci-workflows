@@ -12,15 +12,21 @@ const config = {
   callerPath: '.github/workflows/main-ci-slack.yml',
 };
 const { github, postSlack } = notifier;
-const transition = (...args) => notifier.transition(...args, config);
-const notify = (...args) => notifier.notify(...args, config);
+const transition = (run, previous, repository, options) =>
+  notifier.transition(run, previous, repository, config, options);
+const notify = (run, previous, repository, send, options) =>
+  notifier.notify(run, previous, repository, send, config, options);
 const loadState = (id, repository, request, readArtifact) =>
   notifier.loadState(id, repository, request, config, readArtifact);
 
 const repository = 'contentauth/c2pa-rs';
+const now = Date.parse('2026-11-18T08:30:00Z');
+const morning = Date.parse('2026-11-18T15:00:00Z');
+const halfDayMs = 12 * 60 * 60 * 1000;
 function run(overrides = {}) {
   return {
     name: 'Tier 1A',
+    path: '.github/workflows/tier-1a.yml',
     workflow_id: 1,
     head_branch: 'main',
     head_repository: { full_name: repository },
@@ -31,18 +37,19 @@ function run(overrides = {}) {
     run_attempt: 1,
     head_sha: '1234567890abcdef',
     html_url: 'https://github.com/contentauth/c2pa-rs/actions/runs/1',
+    updated_at: '2026-11-18T08:27:43Z',
     ...overrides,
   };
 }
 
-test('pass -> fail -> fail -> pass -> fail sends only newly failing alerts', () => {
+test('pass -> fail -> fail -> pass -> fail alerts on every failed run', () => {
   let previous;
   const alerts = ['success', 'failure', 'failure', 'success', 'failure'].map((conclusion, i) => {
     const result = transition(run({ conclusion, run_number: i + 1 }), previous, repository);
     previous = result.state;
     return result.alert;
   });
-  assert.deepEqual(alerts, [false, true, false, false, true]);
+  assert.deepEqual(alerts, [false, true, true, false, true]);
 });
 
 test('the first observed failure alerts; a passing baseline does not', () => {
@@ -64,7 +71,7 @@ test('cancelled, skipped, PR, fork, other branch and advisory results do not res
   ]) {
     assert.deepEqual(
       transition(run({ run_number: 2, ...overrides }), previous, repository),
-      { state: previous, alert: false },
+      { state: previous, alert: false, reason: 'ineligible' },
     );
   }
 });
@@ -77,7 +84,7 @@ test('all tiers and supported run events are monitored', () => {
   }
 });
 
-test('wildcard monitors arbitrary workflow names and preserves transition-only alerts', () => {
+test('wildcard monitors arbitrary workflow names and alerts on every failed run', () => {
   const all = { ...config, workflowNames: ['*'] };
   for (const name of ['Release', 'Update schemas', 'New workflow', 'Experimental features (non-blocking)']) {
     let previous;
@@ -86,7 +93,7 @@ test('wildcard monitors arbitrary workflow names and preserves transition-only a
       previous = result.state;
       return result.alert;
     });
-    assert.deepEqual(alerts, [false, true, false, false, true], name);
+    assert.deepEqual(alerts, [false, true, true, false, true], name);
   }
 });
 
@@ -109,7 +116,7 @@ test('wildcard still excludes notifier, PRs, forks, other branches and ignored r
   ]) {
     assert.deepEqual(
       notifier.transition(run({ run_number: 2, ...overrides }), previous, repository, all),
-      { state: previous, alert: false },
+      { state: previous, alert: false, reason: 'ineligible' },
     );
   }
 });
@@ -118,7 +125,7 @@ test('explicit workflow lists also exclude notifier itself by path, regardless o
   const result = transition(run({
     name: 'Tier 1A', path: config.callerPath, event: 'workflow_dispatch', conclusion: 'failure',
   }), undefined, repository);
-  assert.deepEqual(result, { state: undefined, alert: false });
+  assert.deepEqual(result, { state: undefined, alert: false, reason: 'ineligible' });
 });
 
 test('timeouts and startup failures count as failures', () => {
@@ -132,15 +139,15 @@ test('duplicate events and late completions from older runs are ignored', () => 
   for (const run_number of [4, 5]) {
     assert.deepEqual(
       transition(run({ run_number, conclusion: 'failure' }), previous, repository),
-      { state: previous, alert: false },
+      { state: previous, alert: false, reason: 'duplicate-or-older' },
     );
   }
 });
 
-test('rerunning a failure suppresses alerts; successful reruns re-arm alerts', () => {
+test('each failed rerun alerts; successful reruns clear the failing state', () => {
   const first = transition(run({ conclusion: 'failure' }), undefined, repository);
   const second = transition(run({ conclusion: 'failure', run_attempt: 2 }), first.state, repository);
-  assert.equal(second.alert, false);
+  assert.equal(second.alert, true);
   const recovered = transition(run({ run_attempt: 3 }), second.state, repository);
   assert.equal(recovered.state.failing, false);
   const broken = transition(run({ run_number: 2, conclusion: 'failure' }), recovered.state, repository);
@@ -391,6 +398,7 @@ test('entry point delivers a failure and writes artifact state and step output',
     const outputPath = join(directory, 'output');
     writeFileSync(eventPath, JSON.stringify({ workflow_run: run({ conclusion: 'failure' }) }));
     const mock = `
+      Date.now = () => ${now};
       globalThis.fetch = async (url, options) => {
         if (String(url).startsWith('https://hooks.slack.com/')) {
           if (options.method !== 'POST' ||
@@ -426,6 +434,7 @@ test('entry point delivers a failure and writes artifact state and step output',
     assert.match(result.stdout, /MOCK_SLACK_DELIVERY/);
     assert.deepEqual(JSON.parse(readFileSync(join(directory, 'ci-slack-state.json'))), {
       version: 1, workflow_id: 1, run_number: 1, run_attempt: 1, failing: true,
+      failing_since: Date.parse(run().updated_at), last_alert_at: now,
     });
     assert.equal(readFileSync(outputPath, 'utf8'), 'save-state=true\n');
   } finally {
@@ -459,6 +468,7 @@ test('manual test posts a labeled message without writing state or step output',
       },
       encoding: 'utf8',
     });
+
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /MOCK_TEST_DELIVERY/);
     assert.throws(() => readFileSync(join(directory, 'ci-slack-state.json')), { code: 'ENOENT' });
@@ -467,3 +477,310 @@ test('manual test posts a labeled message without writing state or step output',
     rmSync(directory, { recursive: true });
   }
 });
+
+test('reminders follow 7am and 7pm PST without needing a new CI run', async () => {
+  const source = run({ conclusion: 'failure' });
+  const messages = [];
+  const logs = [];
+  const options = { now, log: (line) => logs.push(JSON.parse(line)) };
+  const send = async (text) => messages.push(text);
+  const initial = await notify(source, undefined, repository, send, options);
+  assert.equal(logs.at(-1).reason, 'failure');
+  const before = await notify(source, initial, repository, send, {
+    ...options, now: morning - 1, sweep: true,
+  });
+  assert.equal(messages.length, 1);
+  assert.equal(before.last_alert_at, now);
+  assert.equal(logs.at(-1).decision, 'suppressed');
+  assert.equal(logs.at(-1).reason, 'not-due');
+  assert.equal(logs.at(-1).seconds_until_reminder, 1);
+
+  const due = await notify(source, before, repository, send, {
+    ...options, now: morning, sweep: true,
+  });
+  assert.equal(messages.length, 2);
+  assert.match(messages[1], /is still failing/);
+  assert.match(messages[1], /Known failing since: 2026-11-18T08:27:43.000Z \(6.5 hours\)/);
+  assert.match(messages[1], /Last completed result: 2026-11-18T08:27:43.000Z/);
+  assert.match(messages[1], /actions\/runs\/1/);
+  assert.equal(due.failing_since, Date.parse(source.updated_at));
+  assert.equal(due.last_reminder_slot, morning);
+  assert.equal(logs.at(-1).decision, 'sent');
+  assert.equal(logs.at(-1).reason, 'reminder');
+  assert.equal(logs.at(-1).next_reminder_due, '2026-11-19T03:00:00.000Z');
+
+  const evening = await notify(source, due, repository, send, {
+    ...options, now: morning + halfDayMs, sweep: true,
+  });
+  assert.equal(messages.length, 3);
+  assert.equal(evening.last_reminder_slot, morning + halfDayMs);
+  assert.equal(logs.at(-1).next_reminder_due, '2026-11-19T15:00:00.000Z');
+});
+
+test('each failure alerts immediately without postponing fixed-time reminders', async () => {
+  const messages = [];
+  const send = async (text) => messages.push(text);
+  const source = run({ conclusion: 'failure' });
+  const initial = await notify(source, undefined, repository, send, { now });
+  const repeatedRun = run({
+    conclusion: 'failure', run_number: 2, updated_at: '2026-11-18T14:59:00Z',
+  });
+  const repeated = await notify(repeatedRun, initial, repository, send, { now: morning - 60_000 });
+  assert.equal(messages.length, 2);
+  assert.equal(repeated.last_alert_at, morning - 60_000);
+  assert.equal(repeated.failing_since, initial.failing_since);
+  const reminded = await notify(repeatedRun, repeated, repository, send, { now: morning, sweep: true });
+  assert.equal(messages.length, 3);
+  assert.equal(reminded.last_reminder_slot, morning);
+
+  const recovered = transition(run({ run_number: 3 }), reminded, repository).state;
+  assert.equal(recovered.failing, false);
+  assert.equal(recovered.last_alert_at, undefined);
+  assert.equal(recovered.failing_since, undefined);
+  assert.equal(recovered.last_reminder_slot, undefined);
+  const newFailure = run({
+    conclusion: 'failure', run_number: 4, updated_at: '2026-11-18T15:30:00Z',
+  });
+  const next = transition(newFailure, recovered, repository, { now: morning + 30 * 60_000 });
+  assert.equal(next.reason, 'failure');
+  assert.equal(next.alert, true);
+  assert.equal(next.state.failing_since, Date.parse(newFailure.updated_at));
+  assert.equal(transition(newFailure, next.state, repository, {
+    now: morning + 60 * 60_000, sweep: true,
+  }).reason, 'not-due');
+});
+
+test('duplicate scheduled sweeps are suppressed and a failed reminder can be retried', async () => {
+  const source = run({ conclusion: 'failure' });
+  const previous = transition(source, undefined, repository, { now }).state;
+  const snapshot = structuredClone(previous);
+  const logs = [];
+  const options = {
+    now: morning, sweep: true, log: (line) => logs.push(JSON.parse(line)),
+  };
+  await assert.rejects(notify(source, previous, repository, async () => {
+    throw new Error('delivery failed');
+  }, options), /delivery failed/);
+  assert.deepEqual(previous, snapshot);
+  assert.equal(logs.at(-1).decision, 'delivery-failed');
+
+  const messages = [];
+  const send = async (text) => messages.push(text);
+  const saved = await notify(source, previous, repository, send, options);
+  const newFailure = run({ conclusion: 'failure', run_number: 2 });
+  const afterFailure = await notify(newFailure, saved, repository, send, {
+    ...options, sweep: false, now: morning + 1,
+  });
+  await notify(newFailure, afterFailure, repository, send, { ...options, now: morning + 60_000 });
+  assert.equal(messages.length, 2);
+  assert.equal(logs.at(-1).reason, 'not-due');
+  assert.equal(afterFailure.last_reminder_slot, morning);
+  assert.equal(transition(newFailure, afterFailure, repository, { now: morning + halfDayMs }).reason,
+    'duplicate-or-older');
+  assert.equal(transition(run({ run_number: 0 }), saved, repository, options).reason, 'duplicate-or-older');
+});
+
+test('legacy failing state is eligible at the next fixed slot without fabricating a sent timestamp', () => {
+  const legacy = { version: 1, workflow_id: 1, run_number: 1, run_attempt: 1, failing: true };
+  const source = run({ conclusion: 'failure' });
+  const migrated = transition(source, legacy, repository, { now, sweep: true });
+  assert.equal(migrated.alert, false);
+  assert.equal(migrated.state.last_alert_at, undefined);
+  assert.equal(migrated.state.failing_since, Date.parse(source.updated_at));
+  assert.equal(legacy.failing_since, undefined);
+  const due = transition(source, migrated.state, repository, { now: morning, sweep: true });
+  assert.equal(due.reason, 'reminder');
+  assert.equal(transition(source, legacy, repository, { now: morning, sweep: true }).reason, 'reminder');
+  for (const fields of [
+    { failing_since: 'invalid' },
+    { failing_since: now, last_alert_at: 'invalid' },
+    { failing_since: now, last_alert_at: now - 1 },
+    { failing_since: now, last_reminder_slot: 'invalid' },
+    { failing_since: now, last_reminder_slot: morning + 1 },
+  ]) {
+    assert.throws(() => transition(source, { ...legacy, ...fields }, repository, {
+      now: morning, sweep: true,
+    }), /Invalid saved/);
+  }
+  assert.throws(() => transition(run({ conclusion: 'failure', updated_at: 'invalid' }), undefined,
+    repository, { now }), /timestamp/);
+});
+
+test('PST reminder boundaries stay at 03:00 and 15:00 UTC in winter and summer', () => {
+  for (const at of [
+    '2026-11-19T03:00:00Z', '2026-11-19T15:00:00Z',
+    '2027-07-19T03:00:00Z', '2027-07-19T15:00:00Z',
+  ]) {
+    const time = Date.parse(at);
+    const source = run({ conclusion: 'failure', updated_at: new Date(time - 60_000).toISOString() });
+    const previous = transition(source, undefined, repository, { now: time - 60_000 }).state;
+    assert.equal(transition(source, previous, repository, { now: time - 1, sweep: true }).alert, false, at);
+    const due = transition(source, previous, repository, { now: time, sweep: true });
+    assert.equal(due.alert, true, at);
+    assert.equal(due.state.last_reminder_slot, time, at);
+    assert.equal(transition(source, due.state, repository, {
+      now: time + 10 * 60_000, sweep: true,
+    }).alert, false, at);
+    const delayed = transition(source, previous, repository, { now: time + 10 * 60_000, sweep: true });
+    assert.equal(delayed.alert, true, at);
+    assert.equal(delayed.state.last_reminder_slot, time, at);
+  }
+});
+
+    test('sweeps select the newest eligible result across source events and ignored completions', async () => {
+      const calls = [];
+      const latest = await notifier.latestRun(1, repository, async (path) => {
+        calls.push(path);
+        if (path.includes('event=push')) {
+          if (path.endsWith('page=1')) return Response.json({
+            workflow_runs: Array.from({ length: 100 }, () => run({ conclusion: 'cancelled' })),
+          });
+          return Response.json({ workflow_runs: [
+            run({ run_number: 9, conclusion: 'cancelled' }), run({ run_number: 4, conclusion: 'failure' }),
+          ] });
+        }
+        if (path.includes('event=schedule')) {
+          return Response.json({ workflow_runs: [run({ run_number: 5, event: 'schedule' })] });
+        }
+        return Response.json({ workflow_runs: [run({
+          run_number: 99, event: 'pull_request', conclusion: 'failure',
+        })] });
+      }, config);
+      assert.equal(latest.run_number, 5);
+      assert.equal(latest.conclusion, 'success');
+      assert.equal(calls.length, 4);
+    });
+
+    test('scheduled discovery queues failures and recovery while excluding healthy and notifier workflows', async () => {
+      const workflows = [
+        { id: 1, name: 'Tier 1A', path: run().path, state: 'active' },
+        { id: 2, name: 'Tier 1B', path: '.github/workflows/tier-1b.yml', state: 'active' },
+        { id: 3, name: 'Tier 2', path: '.github/workflows/tier-2.yml', state: 'active' },
+        { id: 4, name: 'Main CI Slack alerts', path: config.callerPath, state: 'active' },
+        { id: 5, name: 'Disabled', path: '.github/workflows/disabled.yml', state: 'disabled_manually' },
+      ];
+      const legacy = { version: 1, workflow_id: 3, run_number: 1, run_attempt: 1, failing: true };
+      const directory = mkdtempSync(join(tmpdir(), 'ci-slack-discover-'));
+      const previousTemp = process.env.RUNNER_TEMP;
+      process.env.RUNNER_TEMP = directory;
+      try {
+        writeFileSync(join(directory, 'ci-slack-state.json'), JSON.stringify(legacy));
+        execFileSync('zip', ['-j', join(directory, 'fixture.zip'), join(directory, 'ci-slack-state.json')]);
+        const ids = await notifier.discover(repository, async (path) => {
+          if (path.startsWith('/actions/workflows?')) return Response.json({ workflows });
+          if (path.includes('/runs?')) {
+            const id = Number(path.match(/workflows\/(\d+)/)[1]);
+            assert.ok(id <= 3);
+            return Response.json({ workflow_runs: path.includes('event=push') ? [run({
+              workflow_id: id, name: workflows[id - 1].name, run_number: 2,
+              conclusion: id === 1 ? 'failure' : 'success',
+            })] : [] });
+          }
+          if (path.includes('/actions/artifacts?')) {
+            return Response.json({ artifacts: path.includes('state-3&') ? [{
+              id: 3, name: 'ci-slack-state-3', workflow_run: { id: 10, head_branch: 'main' },
+            }] : [] });
+          }
+          if (path === '/actions/runs/10') return Response.json({
+            path: config.callerPath, event: 'schedule', head_branch: 'main',
+            head_repository: { full_name: repository },
+          });
+          assert.equal(path, '/actions/artifacts/3/zip');
+          return new Response(readFileSync(join(directory, 'fixture.zip')));
+        }, { ...config, workflowNames: ['*'] }, now);
+        assert.deepEqual(ids, [1, 3]);
+      } finally {
+        if (previousTemp === undefined) delete process.env.RUNNER_TEMP;
+        else process.env.RUNNER_TEMP = previousTemp;
+        rmSync(directory, { recursive: true });
+      }
+    });
+
+    test('scheduled entry point discovers due reminders, reloads state, and notices recovery before sending', () => {
+      const directory = mkdtempSync(join(tmpdir(), 'ci-slack-sweep-'));
+      try {
+        const source = run({ conclusion: 'failure' });
+        const outputPath = join(directory, 'output');
+        const statePath = join(directory, 'ci-slack-state.json');
+        const zipPath = join(directory, 'fixture.zip');
+        writeFileSync(statePath, JSON.stringify(transition(source, undefined, repository, { now }).state));
+        const archive = () => {
+          execFileSync('zip', ['-j', zipPath, statePath]);
+          return readFileSync(zipPath).toString('base64');
+        };
+        const execute = (discovery, current = source) => {
+          const mock = `
+            Date.now = () => ${morning};
+            const source = ${JSON.stringify(current)};
+            globalThis.fetch = async (url, options) => {
+              const path = String(url);
+              if (path.startsWith('https://hooks.slack.com/')) {
+                if (${discovery}) throw new Error('Discovery must not send Slack messages');
+                if (!JSON.parse(options.body).text.includes('still failing')) throw new Error('Not a reminder');
+                console.log('MOCK_REMINDER_DELIVERY');
+                return new Response('ok');
+              }
+              if (path.includes('/actions/workflows?')) return Response.json({ workflows: [{
+                id: 1, name: source.name, path: source.path, state: 'active',
+              }] });
+              if (path.includes('/actions/workflows/1/runs?')) return Response.json({
+                workflow_runs: path.includes('event=push') ? [source] : [],
+              });
+              if (path.includes('/actions/artifacts?')) return Response.json({ artifacts: [{
+                id: 7, name: 'ci-slack-state-1', workflow_run: { id: 10, head_branch: 'main' },
+              }] });
+              if (path.endsWith('/actions/runs/10')) return Response.json({
+                path: ${JSON.stringify(config.callerPath)}, event: 'schedule', head_branch: 'main',
+                head_repository: { full_name: ${JSON.stringify(repository)} },
+              });
+              if (path.endsWith('/actions/artifacts/7/zip')) {
+                return new Response(Buffer.from('${archive()}', 'base64'));
+              }
+              throw new Error('Unexpected request: ' + path);
+            };
+          `;
+          const result = spawnSync(process.execPath, ['--input-type=module'], {
+            input: `${mock}\n${executable}`,
+            cwd: directory,
+            env: {
+              ...process.env, RUNNER_TEMP: directory,
+              GH_TOKEN: 'test-token', GITHUB_API_URL: 'https://api.github.com',
+              GITHUB_REPOSITORY: repository, GITHUB_EVENT_NAME: 'schedule',
+              GITHUB_REF: 'refs/heads/main', GITHUB_OUTPUT: outputPath,
+              SLACK_WEBHOOK_URL: discovery ? '' : 'https://hooks.slack.com/services/mock',
+              CI_SLACK_DISCOVER: String(discovery), CI_SLACK_WORKFLOW_ID: '1',
+              CI_SLACK_WORKFLOWS: JSON.stringify(config.workflowNames),
+              CI_SLACK_BRANCH: config.branch, CI_SLACK_CALLER_PATH: config.callerPath,
+              CI_SLACK_TEST_DELIVERY: 'false',
+            },
+            encoding: 'utf8',
+          });
+          assert.equal(result.status, 0, result.stderr);
+          return result;
+        };
+
+        execute(true);
+        assert.equal(readFileSync(outputPath, 'utf8'), 'workflow-ids=[1]\n');
+        rmSync(outputPath);
+        const reminder = execute(false);
+        assert.match(reminder.stdout, /MOCK_REMINDER_DELIVERY/);
+        assert.match(reminder.stdout, /"decision":"sent","reason":"reminder"/);
+        assert.equal(JSON.parse(readFileSync(statePath)).last_alert_at, morning);
+        assert.equal(JSON.parse(readFileSync(statePath)).last_reminder_slot, morning);
+        assert.equal(readFileSync(outputPath, 'utf8'), 'save-state=true\n');
+
+        const overlap = execute(false);
+        assert.doesNotMatch(overlap.stdout, /MOCK_REMINDER_DELIVERY/);
+        assert.match(overlap.stdout, /"decision":"suppressed","reason":"not-due"/);
+        rmSync(outputPath);
+        execute(true);
+        assert.equal(readFileSync(outputPath, 'utf8'), 'workflow-ids=[]\n');
+
+        const recovered = execute(false, run({ run_number: 2 }));
+        assert.doesNotMatch(recovered.stdout, /MOCK_REMINDER_DELIVERY/);
+        assert.match(recovered.stdout, /"reason":"recovered"/);
+        assert.equal(JSON.parse(readFileSync(statePath)).failing, false);
+      } finally {
+        rmSync(directory, { recursive: true });
+      }
+    });

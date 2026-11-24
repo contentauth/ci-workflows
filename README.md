@@ -2,14 +2,17 @@
 
 Reusable GitHub Actions workflows for Content Authenticity Initiative repositories.
 
-## Slack alerts when CI starts failing
+## Slack alerts and failure reminders
 
-The reusable [CI Slack workflow](.github/workflows/ci-slack.yml) alerts when a
-monitored workflow first fails, then stays quiet until it passes and fails again.
-Each workflow is tracked independently. Successful runs silently re-arm alerts;
+The reusable [CI Slack workflow](.github/workflows/ci-slack.yml) alerts on every
+new failed run or rerun of a monitored workflow, even if it is already failing.
+It also reminds at **7am and 7pm PST (fixed UTC-8)** while failures persist.
+Each workflow is tracked independently. Successful runs silently stop reminders;
 there are no recovery messages. Timeouts and startup failures count as failures.
 Cancelled, skipped, neutral, pull-request, fork, and unrelated-branch results are
 ignored. Pushes, schedules, and manual source runs are supported.
+Reminders identify the last completed result and the known failure duration; they
+do not rerun CI or imply that a fresh build has failed.
 
 ### Setup
 
@@ -29,6 +32,8 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: '0 3,15 * * *' # 7am and 7pm PST (fixed UTC-8).
 
 permissions:
   actions: read
@@ -53,6 +58,14 @@ Change both branch settings together. `caller-workflow-path` must match the
 wrapper's actual path. GitHub requires the wrapper on the default branch for
 `workflow_run` delivery.
 
+The schedule checks for due reminders even when CI runs only nightly.
+PST is interpreted literally: reminders use 03:00 and 15:00 UTC year-round, not
+daylight-saving-aware Pacific time. GitHub schedules are best-effort and may run
+late. Each reminder slot is sent at most once after successful state persistence;
+repeated or delayed executions do not replay every missed slot. New failure
+alerts do not postpone the fixed-time reminders. A failure immediately before a
+scheduled reminder can therefore produce both messages close together.
+
 All-workflow coverage still accepts only push, schedule, and manual source runs.
 It checks overall workflow conclusions, not individual jobs. A failed job with
 `continue-on-error` may leave the workflow successful and will not produce an alert.
@@ -69,22 +82,50 @@ without changing alert state. This is a real Slack post, not a dry run.
 - Workflow changes in participating repositories can access the shared webhook.
   Protect those branches and review changes to their workflows. The webhook
   grants posting access to its Slack channel, not channel-history access.
-- Messages include only the repository, workflow name, result, commit SHA, and
-  source-run link, with link and media unfurling disabled.
+- Messages include the repository, workflow name, result, commit SHA, and
+  source-run link, plus failure age and last-result time for reminders. Link and
+  media unfurling are disabled.
 - Per-workflow state artifacts live in the **calling repository**, with 90-day
   retention refreshed on each processed result. Expired or deleted state means
   the next observed failure alerts again. Use one wrapper per monitored workflow
   and branch; changing the wrapper path or branch resets its trusted state.
-- State is accepted only from the configured wrapper's `workflow_run` executions
+- State is accepted only from the configured wrapper's `workflow_run` or scheduled executions
   on the configured branch in the same repository.
-- Rerun attempts are tracked. A result from an older run number cannot overwrite
-  health once a newer run number has been processed.
+- Rerun attempts are tracked. Duplicate completion events and results from older
+  run numbers are suppressed, so stale results cannot overwrite newer health.
 - Notifications are serialized per wrapper, branch, and workflow, using GitHub's
-  `queue: max` (up to 100 pending jobs). Queue overflow cancels excess jobs.
+  `queue: max` (up to 100 pending jobs). Completion events and reminder sweeps use
+  the same lock and reload state inside it. Queue overflow cancels excess jobs.
+- Sweeps inspect the latest eligible completed result across push, schedule, and
+  manual runs. Discovery queues only notifications, recoveries, and state
+  upgrades; healthy workflows do not each consume a notification runner.
+- Each decision logs `sent`, `suppressed`, `queued`, or `delivery-failed`, its reason,
+  and relevant workflow/run metadata. Failing state includes the next reminder
+  due time and seconds until that slot. No webhook URLs or tokens are logged.
 - Slack or GitHub API errors fail visibly. Failed Slack delivery does not advance
   state; rerun the failed notifier after fixing the problem. Slack delivery and
   state upload are not atomic: if upload fails after Slack accepts the message,
   a retry can send a duplicate. There are no automatic webhook retries.
+
+### Upgrading existing callers
+
+Publish and review the shared workflow change, then update each caller's full SHA
+pin and add the twice-daily schedule shown above. A schedule alone does not enable
+reminders with an older pin. Callers without a schedule send failure alerts but
+not reminders.
+
+Existing version-1 artifacts remain readable; timestamps are additive.
+For an already-failing workflow without timestamps, the latest completed failure
+provides a conservative known-failing-since timestamp, since the original failure
+time was not stored. It can receive a reminder at the next scheduled slot.
+Failure alerts and reminders track their delivery times independently, so each
+new failure alerts without resetting the reminder schedule. Healthy state and
+existing per-workflow artifact names are unchanged.
+
+Rolling back the caller's SHA pin restores transition-only alerts. Older readers
+ignore scheduled artifacts and the extra fields in completion-event artifacts;
+no artifacts need to be deleted. In-flight runs using the older pin cannot
+coordinate reminder timestamps, so let them finish before changing pins.
 
 ## Development
 
