@@ -1,12 +1,18 @@
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const workflow = readFileSync(new URL('../.github/workflows/ci-slack.yml', import.meta.url), 'utf8');
-const start = "          node --input-type=module <<'NOTIFIER'\n";
-const end = '          NOTIFIER\n';
-if (!workflow.includes(start) || !workflow.includes(end)) {
-  throw new Error('Cannot locate the inline notifier implementation');
+export * as notifier from '../scripts/ci-slack.mjs';
+
+const script = fileURLToPath(new URL('../scripts/ci-slack.mjs', import.meta.url));
+
+export function executeNotifier(options, mock) {
+  const args = [];
+  if (mock) {
+    const preload = join(options.cwd, 'mock.mjs');
+    writeFileSync(preload, mock);
+    args.push('--import', preload);
+  }
+  return spawnSync(process.execPath, [...args, script], { ...options, encoding: 'utf8' });
 }
-export const executable = workflow.split(start)[1].split(end)[0]
-  .split('\n').map((line) => line.replace(/^ {10}/, '')).join('\n');
-const implementation = executable.split('// Tests import the implementation above')[0];
-export const notifier = await import(`data:text/javascript;base64,${Buffer.from(implementation).toString('base64')}`);
